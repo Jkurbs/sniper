@@ -65,7 +65,10 @@ TEST_MODE = True
 
 PERCENTAGE = 1.004
 
-SYMBOL = 'ETHUSD'
+SYMBOL = 'LINKUSD'
+
+SYMBOLS = []
+
 
 # path to the saved positions file
 positions_file_path = 'positions.csv'
@@ -76,8 +79,11 @@ trades_file_path = 'trades.csv'
 # positions column
 positions_columns = ['date', 'id', 'pair', 'type', 'side', 'price', 'amount', 'filled', 'status', 'position']
 # trades column
-trades_columns = ['symbol', 'id', 'orderId', 'orderListId', 'price', 'qty', 'quoteQty', 'commission', 'commissionAsset', 'time', 'isBuyer', 'isMaker', 'isBestMatch']
+trades_columns = ['id', 'price', 'qty', 'quoteQty', 'time', 'isBuyerMaker', 'isBestMatch']
 
+
+high = 0 
+low = 0
 
 def write_log(file_path, data, columns):
     try:
@@ -111,14 +117,17 @@ class St_ampe_dOut:
 
 sys.stdout = St_ampe_dOut()
 
-def current_price(): 
-    avg_price = client.get_symbol_ticker(symbol=SYMBOL)
+
+def current_price(symbol): 
+    avg_price = client.get_symbol_ticker(symbol=symbol)
     return float(avg_price.get('price'))
 
-def convert_volume(quantity):
+def convert_volume(symbol, price, quantity):
     '''Converts the volume given in QUANTITY from USDT to ETH volume'''
 
-    price = current_price()
+    if quantity < 10: 
+        return
+
     lot_size = 0
     volume = 0
 
@@ -126,7 +135,7 @@ def convert_volume(quantity):
     # max accuracy for BTC for example is 6 decimal points
     # while XRP is only 1
     try:
-        info = client.get_symbol_info(SYMBOL)
+        info = client.get_symbol_info(symbol)
         step_size = info['filters'][2]['stepSize']
         lot_size = step_size.index('1') - 1
 
@@ -142,7 +151,7 @@ def convert_volume(quantity):
     return volume
 
 
-def get_balances(client): 
+def get_balances(client, symbol): 
     details = client.get_account()
     balances = details.get('balances')
 
@@ -153,20 +162,18 @@ def get_balances(client):
         asset = balance.get('asset')
         if asset == 'USD': 
             usd = float(balance.get('free'))
-        if asset == 'ETH': 
+        if asset == symbol: 
             eth = float(balance.get('free'))
     return usd, eth
 
 
-POSITIONS = []
-
-def place_test_order(client, side, quantity, price, coin_value = None):
+def place_test_order(client, symbol, side, quantity, price, coin_value = None):
     
     try:
         client.create_test_order(
-            symbol = SYMBOL,
+            symbol = symbol,
             side = side,
-            type = 'LIMIT',
+            type = 'MARKET',
             quantity = quantity if coin_value == None else coin_value, 
             price = price, 
             timeInForce = 'GTC'
@@ -176,46 +183,48 @@ def place_test_order(client, side, quantity, price, coin_value = None):
 
 
 
-def update_positions():
+
+def place_order(client, symbol, side, quantity, price, coin_value = None):
+    try:
+        client.order_limit(
+            symbol = symbol, 
+            side = side,
+            quantity = quantity, 
+            price = price,
+            timeInForce = 'GTC'
+        )
+    except Exception as e:
+        print('Error ',e)  
+
+
+def log_trades(symbol):
     '''add every coin bought to our portfolio for tracking/selling later'''
     print('Updating positions...')
-    orders = client.get_open_orders(symbol=SYMBOL)
+    trades = client.get_recent_trades(symbol=symbol, limit=1)
 
     # binance sometimes returns an empty list, the code will wait here until binance returns the order
-    while orders == []:
+    while trades == []:
         print('Binance is being slow in returning the order, calling the API again...')
-        orders = client.get_open_orders(symbol=SYMBOL)
+        trades = client.get_recent_trades(symbol=symbol, limit=1)
         time.sleep(1)
-
-    for index, order in enumerate(orders):
-        new_limit = {
-            'date': datetime.now().strftime("%d/%m %H:%M:%S"),
-            'id': order['orderId'],
-            'pair': order['symbol'],
-            'type': order['type'],
-            'side': order['side'],
-            'price': order['price'],
-            'amount': order['origQty'],
-            'filled': order['executedQty'],
-            'status': order['status'],
-            'position': POSITIONS[index]['position']
-        }
-        # Save positions
-        write_log(positions_file_path, new_limit, positions_columns)
+    for trade in trades:
+        # Save trade
+        write_log(trades_file_path, trade, trades_columns)
 
 
-def get_positions(): 
+def get_trades(): 
     try:
-        with open(positions_file_path, 'r') as csvfile:
+        with open(trades_file_path, 'r') as csvfile:
             reader = csv.DictReader(csvfile, delimiter=",")
             positions = list(reader)
             for position in positions:
                 csvfile.close()
                 return position
     except IOError:
-        print("I/O error")
+        print("No positions")
 
-def delete_positions(): 
+
+def delete_trades(): 
     # opening the file with w+ mode truncates the file
     print("Deleting positions...")
     try:
@@ -227,12 +236,55 @@ def delete_positions():
         print("I/O error")
 
 
+def get_historical_data(symbol): 
+    global high, low
+    high = 0
+    low = 0
+    data = client.get_historical_klines(symbol, Client.KLINE_INTERVAL_1DAY, "2 days ago UTC")
+    for d in data:
+        high += float(d[2])
+        low += float(d[3])
+    SYMBOLS.append({'symbol': symbol, 'high': round(high/2, 2), 'low': round(low/2, 2)})
+    return round(high/2, 2), round(low/2, 2)
+
+def snipe(client): 
+    for index, symbol in enumerate(SYMBOLS):
+        sym = symbol['symbol']
+        price = current_price(sym)
+
+        high = symbol['high']
+        low = symbol['low']
+
+        usd, coin = get_balances(client, sym)
+        volume = convert_volume(sym, price, 500)
+
+        if hasattr(SYMBOLS[index], 'side') == False: 
+            SYMBOLS[index]['side'] = 'BUY'
+
+        if SYMBOLS[index]['side'] == 'SELL' and price >= high and coin != 0:
+            place_order(client, sym, 'SELL', volume, low)
+            SYMBOLS[index]['side'] = 'SELL'
+            log_trades(sym) 
+            print(f'{txcolors.SELL_PROFIT}Selling at {high} high')
+        elif price <= low and usd >= 10:
+            place_order(client, sym, 'BUY', volume, high)
+            SYMBOLS[index]['side'] = 'BUY'
+            log_trades(sym)  
+            print(f'{txcolors.BUY}Buying at {low} low')
+        else:
+            print(f'No shot for {sym} Price: {price}, High: {high} Low: {low}')
+
+
 if __name__ == '__main__':
     print('Press Ctrl-Q to stop the script')
 
     args = parse_args()
 
+    DEFAULT_CONFIG_FILE = 'config.yml'
     DEFAULT_CREDS_FILE = 'creds.yml'
+
+
+    symbols=[line.strip() for line in open('tickers.txt')]
 
     creds_file = args.creds if args.creds else DEFAULT_CREDS_FILE
     parsed_creds = load_config(creds_file)
@@ -259,24 +311,37 @@ if __name__ == '__main__':
     READ_TIMEOUT_COUNT = 0
     CONNECTION_ERROR_COUNT = 0
 
-    # place_positions(client)
-    print('Starting monitoring positions...')
+    for symbol in symbols:
+        get_historical_data(symbol+'USD')
+
+    print('Sniper on roof...')
     while True:
         try:
-
-            print("")
-            # monitor_positions(client)
+            snipe(client)
         except ReadTimeout as rt:
             READ_TIMEOUT_COUNT += 1
             print(f'{txcolors.WARNING}We got a timeout error from from binance. Going to re-loop. Current Count: {READ_TIMEOUT_COUNT}\n{rt}{txcolors.DEFAULT}')
         except ConnectionError as ce:
             CONNECTION_ERROR_COUNT +=1 
             print(f'{txcolors.WARNING}We got a timeout error from from binance. Going to re-loop. Current Count: {CONNECTION_ERROR_COUNT}\n{ce}{txcolors.DEFAULT}')
-        time.sleep(3)
+        time.sleep(5)
 
 
 
-    
+# [
+#     1499040000000,      # Open time
+#     "0.01634790",       # Open
+#     "0.80000000",       # High
+#     "0.01575800",       # Low
+#     "0.01577100",       # Close
+#     "148976.11427815",  # Volume
+#     1499644799999,      # Close time
+#     "2434.19055334",    # Quote asset volume
+#     308,                # Number of trades
+#     "1756.87402397",    # Taker buy base asset volume
+#     "28.46694368",      # Taker buy quote asset volume
+#     "17928899.62484339" # Can be ignored
+# ]
 
 
 
